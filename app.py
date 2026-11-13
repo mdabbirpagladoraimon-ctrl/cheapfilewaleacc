@@ -551,11 +551,27 @@ def admin_bulk_import():
         if not f:
             flash("no file uploaded", "err")
             return redirect(url_for("admin_bulk_import"))
-        raw = f.read().decode("utf-8", errors="replace")
+
+        # utf-8-sig strips the Excel BOM; errors=replace prevents crashes on bad bytes
+        raw = f.read().decode("utf-8-sig", errors="replace")
+        # normalize windows line endings
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
         reader = csv.DictReader(io.StringIO(raw))
-        fields = {(k or "").strip().lower() for k in (reader.fieldnames or [])}
-        if not {"email", "password", "selling_price"}.issubset(fields):
-            flash("csv header needs: email,password,selling_price", "err")
+        raw_fields = list(reader.fieldnames or [])
+
+        def norm(k):
+            return (k or "").replace("\ufeff", "").strip().lower()
+
+        normalized_fields = {norm(k) for k in raw_fields}
+        required = {"email", "password", "selling_price"}
+        if not required.issubset(normalized_fields):
+            flash(
+                "csv header mismatch. found: "
+                + (", ".join(raw_fields) if raw_fields else "(none)")
+                + ". need: email,password,selling_price",
+                "err",
+            )
             return redirect(url_for("admin_bulk_import"))
 
         client = FileWaleClient(Config.FILEWALE_API)
@@ -565,14 +581,16 @@ def admin_bulk_import():
         failed = []
 
         for i, row in enumerate(reader, start=2):
-            row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-            email = row.get("email")
-            password = row.get("password")
+            clean = {norm(k): (v or "").strip() for k, v in row.items()}
+
+            email = clean.get("email")
+            password = clean.get("password")
             if not email or not password:
                 skipped += 1
                 continue
+
             try:
-                selling_price = float(row.get("selling_price") or 0)
+                selling_price = float(clean.get("selling_price") or 0)
             except ValueError:
                 failed.append(f"row {i}: bad selling_price")
                 continue
@@ -581,14 +599,14 @@ def admin_bulk_import():
                 continue
 
             plan_name = None
-            plan_category = (row.get("plan_category") or "auto").lower()
+            plan_category = (clean.get("plan_category") or "auto").lower()
             original_price = None
-            original_currency = (row.get("currency") or "USD").upper()
+            original_currency = (clean.get("currency") or "USD").upper()
             try:
-                cost = float(row.get("cost") or 0)
+                cost = float(clean.get("cost") or 0)
             except ValueError:
                 cost = 0
-            notes = row.get("notes") or ""
+            notes = clean.get("notes") or ""
             expiry_date = None
             status = "OFFLINE"
             fw_balance = 0
@@ -619,9 +637,9 @@ def admin_bulk_import():
                     except Exception:
                         status = "LIVE"
             except FileWaleError:
-                if row.get("original_price"):
+                if clean.get("original_price"):
                     try:
-                        original_price = float(row["original_price"])
+                        original_price = float(clean["original_price"])
                     except ValueError:
                         pass
 
