@@ -547,85 +547,119 @@ def admin_add_account():
 def admin_bulk_import():
     if request.method == "POST":
         require_csrf()
-        f = request.files.get("csv")
+        f = request.files.get("file")
         if not f:
             flash("no file uploaded", "err")
             return redirect(url_for("admin_bulk_import"))
 
-        # utf-8-sig strips the Excel BOM; errors=replace prevents crashes on bad bytes
+        filename = f.filename.lower()
+        if not (filename.endswith(".txt") or filename.endswith(".csv")):
+            flash("file must be .txt or .csv", "err")
+            return redirect(url_for("admin_bulk_import"))
+
+        try:
+            default_price = float(request.form.get("default_price") or 10)
+        except ValueError:
+            default_price = 10.0
+
         raw = f.read().decode("utf-8-sig", errors="replace")
-        # normalize windows line endings
         raw = raw.replace("\r\n", "\n").replace("\r", "\n")
 
-        reader = csv.DictReader(io.StringIO(raw))
-        raw_fields = list(reader.fieldnames or [])
+        accounts_to_import = []
 
-        def norm(k):
-            return (k or "").replace("\ufeff", "").strip().lower()
+        if filename.endswith(".txt"):
+            # Parse user:pass lines
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Handle the combo-checker pipe format gracefully
+                if " | " in line:
+                    line = line.split(" | ")[0].strip()
+                if ":" in line:
+                    email, _, password = line.partition(":")
+                    email = email.strip()
+                    password = password.strip()
+                    if email and password:
+                        accounts_to_import.append({
+                            "email": email,
+                            "password": password,
+                            "selling_price": default_price,
+                            "plan_category": "auto",
+                            "original_price": None,
+                            "currency": "USD",
+                            "cost": 0,
+                            "notes": "txt bulk upload"
+                        })
+        else:
+            # Parse CSV
+            reader = csv.DictReader(io.StringIO(raw))
+            raw_fields = list(reader.fieldnames or [])
+            def norm(k):
+                return (k or "").replace("\ufeff", "").strip().lower()
+            normalized_fields = {norm(k) for k in raw_fields}
+            if not {"email", "password", "selling_price"}.issubset(normalized_fields):
+                flash("csv header mismatch. need: email,password,selling_price", "err")
+                return redirect(url_for("admin_bulk_import"))
+            
+            for row in reader:
+                clean = {norm(k): (v or "").strip() for k, v in row.items()}
+                email = clean.get("email")
+                password = clean.get("password")
+                if not email or not password:
+                    continue
+                try:
+                    sp = float(clean.get("selling_price") or default_price)
+                except ValueError:
+                    sp = default_price
+                accounts_to_import.append({
+                    "email": email,
+                    "password": password,
+                    "selling_price": sp,
+                    "plan_category": (clean.get("plan_category") or "auto").lower(),
+                    "original_price": float(clean["original_price"]) if clean.get("original_price") else None,
+                    "currency": (clean.get("currency") or "USD").upper(),
+                    "cost": float(clean.get("cost") or 0),
+                    "notes": clean.get("notes") or ""
+                })
 
-        normalized_fields = {norm(k) for k in raw_fields}
-        required = {"email", "password", "selling_price"}
-        if not required.issubset(normalized_fields):
-            flash(
-                "csv header mismatch. found: "
-                + (", ".join(raw_fields) if raw_fields else "(none)")
-                + ". need: email,password,selling_price",
-                "err",
-            )
+        if not accounts_to_import:
+            flash("no valid accounts found in file", "err")
             return redirect(url_for("admin_bulk_import"))
 
         client = FileWaleClient(Config.FILEWALE_API)
         c = get_db()
         added = 0
-        skipped = 0
-        failed = []
+        failed = 0
 
-        for i, row in enumerate(reader, start=2):
-            clean = {norm(k): (v or "").strip() for k, v in row.items()}
-
-            email = clean.get("email")
-            password = clean.get("password")
-            if not email or not password:
-                skipped += 1
-                continue
-
-            try:
-                selling_price = float(clean.get("selling_price") or 0)
-            except ValueError:
-                failed.append(f"row {i}: bad selling_price")
-                continue
-            if selling_price <= 0:
-                failed.append(f"row {i}: selling_price must be > 0")
-                continue
-
+        for acc in accounts_to_import:
             plan_name = None
-            plan_category = (clean.get("plan_category") or "auto").lower()
-            original_price = None
-            original_currency = (clean.get("currency") or "USD").upper()
-            try:
-                cost = float(clean.get("cost") or 0)
-            except ValueError:
-                cost = 0
-            notes = clean.get("notes") or ""
+            plan_category = acc["plan_category"]
+            original_price = acc["original_price"]
+            original_currency = acc["currency"]
             expiry_date = None
             status = "OFFLINE"
             fw_balance = 0
             fw_currency = "USD"
+            notes = acc["notes"]
 
             try:
-                snap = client.snapshot(email, password)
+                snap = client.snapshot(acc["email"], acc["password"])
                 sub = snap.get("subscription") or {}
                 plan = sub.get("plan") or {}
                 wallet = snap.get("wallet") or {}
                 fw_balance = float(wallet.get("balance") or 0)
                 fw_currency = wallet.get("currency") or "USD"
                 plan_name = plan.get("name")
+                
                 if plan.get("price") is not None:
                     original_price = float(plan["price"])
                 if plan.get("currency"):
                     original_currency = str(plan["currency"]).upper()
+                
                 if plan_name and plan_category == "auto":
                     plan_category = categorize(plan_name)
+                
                 end = sub.get("endDate")
                 if end:
                     expiry_date = end
@@ -636,17 +670,14 @@ def admin_bulk_import():
                         status = "LIVE" if end_dt > datetime.now(timezone.utc) else "EXPIRED"
                     except Exception:
                         status = "LIVE"
-            except FileWaleError:
-                if clean.get("original_price"):
-                    try:
-                        original_price = float(clean["original_price"])
-                    except ValueError:
-                        pass
+            except FileWaleError as e:
+                failed += 1
+                continue
 
             if plan_category not in ("silver", "gold"):
                 plan_category = "silver"
             if original_price is None:
-                original_price = round(selling_price * 2, 2)
+                original_price = round(acc["selling_price"] * 2, 2)
                 notes = (notes + " [price auto-guessed x2]").strip()
 
             c.execute(
@@ -655,17 +686,15 @@ def admin_bulk_import():
                     original_currency, selling_price, cost, status, expiry_date,
                     last_sync, notes, fw_balance, fw_currency)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (enc(email), enc(password), plan_name, plan_category, original_price,
-                 original_currency, selling_price, cost, status, expiry_date,
+                (enc(acc["email"]), enc(acc["password"]), plan_name, plan_category, original_price,
+                 original_currency, acc["selling_price"], acc["cost"], status, expiry_date,
                  datetime.utcnow().isoformat(timespec="seconds"), notes,
                  fw_balance, fw_currency),
             )
             added += 1
 
         c.close()
-        flash(f"imported {added}, skipped {skipped}, failed {len(failed)}", "ok")
-        for m in failed[:10]:
-            flash(m, "err")
+        flash(f"imported {added} accounts, failed {failed}", "ok")
         return redirect(url_for("admin_stock"))
 
     return render_template("admin_bulk_import.html")
